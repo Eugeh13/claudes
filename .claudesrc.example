@@ -1,0 +1,17 @@
+# .claudesrc — drop this at your repo root and rename to `.claudesrc`
+# It is sourced as shell, so keep it simple KEY=value.
+
+# Number of worker worktrees to create (integrator is added on top of this)
+CLAUDES_WORKERS=3
+
+# Base branch the workers branch off
+CLAUDES_BASE=main
+
+# Prefix for worktree folders and branches: claude-1, claude-2, ...  /  claude/1, claude/2, ...
+CLAUDES_PREFIX=claude
+
+# tmux session name
+CLAUDES_SESSION=claudes
+
+# Override the claude launcher (e.g. "claude --dangerously-skip-permissions" for sandboxed envs)
+# CLAUDES_CLAUDE_CMD="claude"

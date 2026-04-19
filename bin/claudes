@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# claudes — orchestrate multiple Claude Code sessions in tmux with git worktrees
+# https://github.com/<your-user>/claudes
+set -euo pipefail
+
+# ---------- defaults (can be overridden by env or .claudesrc) ----------
+SESSION_NAME="${CLAUDES_SESSION:-claudes}"
+BASE_BRANCH="${CLAUDES_BASE:-main}"
+NUM_WORKERS="${CLAUDES_WORKERS:-3}"
+WORKTREE_PREFIX="${CLAUDES_PREFIX:-claude}"
+CLAUDE_CMD="${CLAUDES_CLAUDE_CMD:-claude}"
+
+# ---------- tiny helpers ----------
+red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+die() { red "error: $*"; exit 1; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+load_config() {
+  # Source .claudesrc from repo root if it exists
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ -n "$root" && -f "$root/.claudesrc" ]]; then
+    # shellcheck disable=SC1090,SC1091
+    source "$root/.claudesrc"
+  fi
+}
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null \
+    || die "not inside a git repository"
+}
+
+worktree_dir() {
+  local root; root=$(repo_root)
+  echo "${root%/}-worktrees"
+}
+
+list_worktrees() {
+  # Print absolute paths of claudes-managed worktrees, one per line, sorted
+  local wt_dir; wt_dir=$(worktree_dir)
+  git worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree/ {print $2}' \
+    | grep -E "${wt_dir}/${WORKTREE_PREFIX}-[0-9]+\$" \
+    | sort -V
+}
+
+# ---------- subcommands ----------
+usage() {
+  cat <<EOF
+$(bold claudes) — orchestrate multiple Claude Code sessions in tmux
+
+$(bold USAGE)
+  claudes <command> [options]
+
+$(bold COMMANDS)
+  init [-n N] [-b BRANCH]   Create N worktrees branched off BRANCH (default: 3, main)
+  start [--cc]              Launch tmux session with Claude in each pane
+                              --cc  use 'tmux -CC' (native iTerm2 panes)
+  attach [--cc]             Re-attach to a running claudes session
+  stop                      Kill the tmux session (worktrees remain intact)
+  clean [--force]           Remove all claudes worktrees and their branches
+  list                      Show active claudes worktrees
+  doctor                    Check dependencies (tmux, git, claude)
+  help                      Show this message
+
+$(bold CONFIG)
+  Place a .claudesrc file at your repo root to set defaults, e.g.:
+    CLAUDES_WORKERS=4
+    CLAUDES_BASE=develop
+    CLAUDES_PREFIX=claude
+
+$(bold ENV VARS)
+  CLAUDES_SESSION   tmux session name       (default: claudes)
+  CLAUDES_WORKERS   default worker count    (default: 3)
+  CLAUDES_BASE      default base branch     (default: main)
+  CLAUDES_PREFIX    branch/folder prefix    (default: claude)
+  CLAUDES_CLAUDE_CMD command to launch Claude (default: claude)
+
+$(bold EXAMPLES)
+  cd ~/code/myproject
+  claudes doctor
+  claudes init -n 3 -b main
+  claudes start --cc
+EOF
+}
+
+cmd_doctor() {
+  local ok=0
+  for tool in git tmux "$CLAUDE_CMD"; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      green "  ✓ $tool   $(command -v "$tool")"
+    else
+      red   "  ✗ $tool   not found"
+      ok=1
+    fi
+  done
+  if [[ $ok -eq 0 ]]; then
+    green "all good"
+  else
+    red "missing dependencies"
+    exit 1
+  fi
+}
+
+cmd_init() {
+  local n="$NUM_WORKERS"
+  local base="$BASE_BRANCH"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n) n="$2"; shift 2 ;;
+      -b) base="$2"; shift 2 ;;
+      *)  die "unknown flag for init: $1" ;;
+    esac
+  done
+
+  [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] || die "-n must be a positive integer"
+
+  local root; root=$(repo_root)
+  local wt_dir; wt_dir=$(worktree_dir)
+
+  # Verify base branch exists
+  if ! git -C "$root" rev-parse --verify "$base" >/dev/null 2>&1; then
+    die "base branch '$base' not found in repo"
+  fi
+
+  mkdir -p "$wt_dir"
+  bold "creating $n worktrees in $wt_dir (branched from $base)"
+
+  for i in $(seq 1 "$n"); do
+    local branch="${WORKTREE_PREFIX}/${i}"
+    local path="${wt_dir}/${WORKTREE_PREFIX}-${i}"
+
+    if [[ -d "$path" ]]; then
+      yellow "  ↷ $path already exists, skipping"
+      continue
+    fi
+
+    # If branch exists, reuse it; otherwise create
+    if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$root" worktree add "$path" "$branch" >/dev/null
+    else
+      git -C "$root" worktree add -b "$branch" "$path" "$base" >/dev/null
+    fi
+    green "  ✓ $path  →  $branch"
+  done
+
+  bold "done. run 'claudes start' to launch."
+}
+
+_spawn_pane() {
+  # _spawn_pane <target-session> <dir> <label> <branch>
+  local target="$1" dir="$2" label="$3" branch="$4"
+  local banner="[ ${label} | branch: ${branch} ] type: ${CLAUDE_CMD}"
+  # shell-escape banner minimally by using single quotes and escaping any single quotes in inputs
+  tmux send-keys -t "$target" "clear && echo '${banner//\'/\'\\\'\'}' && ${CLAUDE_CMD}" C-m
+}
+
+cmd_start() {
+  local use_cc=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cc) use_cc=1; shift ;;
+      *)    die "unknown flag for start: $1" ;;
+    esac
+  done
+
+  require tmux
+  require git
+  require "$CLAUDE_CMD"
+
+  local root; root=$(repo_root)
+  local worktrees=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && worktrees+=("$line")
+  done < <(list_worktrees)
+
+  [[ ${#worktrees[@]} -ge 1 ]] \
+    || die "no claudes worktrees found. run 'claudes init' first."
+
+  # Kill any pre-existing session of the same name
+  tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+  # First pane: first worktree
+  local first="${worktrees[0]}"
+  local first_label; first_label=$(basename "$first")
+  local first_branch; first_branch=$(git -C "$first" branch --show-current)
+  tmux new-session -d -s "$SESSION_NAME" -n work -c "$first"
+  _spawn_pane "$SESSION_NAME" "$first" "$first_label" "$first_branch"
+
+  # Additional worker panes
+  local i
+  for (( i = 1; i < ${#worktrees[@]}; i++ )); do
+    local wt="${worktrees[$i]}"
+    local label; label=$(basename "$wt")
+    local branch; branch=$(git -C "$wt" branch --show-current)
+    tmux split-window -t "$SESSION_NAME" -c "$wt"
+    _spawn_pane "$SESSION_NAME" "$wt" "$label" "$branch"
+    tmux select-layout -t "$SESSION_NAME" tiled >/dev/null
+  done
+
+  # Integrator pane: the main repo on its current branch
+  local integrator_branch; integrator_branch=$(git -C "$root" branch --show-current)
+  tmux split-window -t "$SESSION_NAME" -c "$root"
+  _spawn_pane "$SESSION_NAME" "$root" "integrator" "$integrator_branch"
+  tmux select-layout -t "$SESSION_NAME" tiled >/dev/null
+
+  # Enable mouse for convenience
+  tmux set-option -t "$SESSION_NAME" -g mouse on >/dev/null
+
+  # Attach
+  if [[ $use_cc -eq 1 ]]; then
+    tmux -CC attach -t "$SESSION_NAME"
+  else
+    tmux attach -t "$SESSION_NAME"
+  fi
+}
+
+cmd_attach() {
+  local use_cc=0
+  [[ "${1:-}" == "--cc" ]] && use_cc=1
+  tmux has-session -t "$SESSION_NAME" 2>/dev/null \
+    || die "no running session named '$SESSION_NAME'"
+  if [[ $use_cc -eq 1 ]]; then
+    tmux -CC attach -t "$SESSION_NAME"
+  else
+    tmux attach -t "$SESSION_NAME"
+  fi
+}
+
+cmd_stop() {
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    tmux kill-session -t "$SESSION_NAME"
+    green "killed tmux session '$SESSION_NAME'. worktrees left intact."
+  else
+    yellow "no session named '$SESSION_NAME' to stop"
+  fi
+}
+
+cmd_list() {
+  local root; root=$(repo_root)
+  bold "claudes worktrees for $(basename "$root"):"
+  local any=0
+  while IFS= read -r wt; do
+    [[ -z "$wt" ]] && continue
+    any=1
+    local branch; branch=$(git -C "$wt" branch --show-current 2>/dev/null || echo "?")
+    printf '  %-60s  %s\n' "$wt" "→ $branch"
+  done < <(list_worktrees)
+  if [[ $any -eq 0 ]]; then
+    yellow "  (none. run 'claudes init')"
+  fi
+}
+
+cmd_clean() {
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+
+  local root; root=$(repo_root)
+  local worktrees=()
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] && worktrees+=("$wt")
+  done < <(list_worktrees)
+
+  [[ ${#worktrees[@]} -gt 0 ]] || { yellow "nothing to clean"; exit 0; }
+
+  if [[ $force -eq 0 ]]; then
+    bold "about to remove ${#worktrees[@]} worktree(s) and their branches:"
+    printf '  - %s\n' "${worktrees[@]}"
+    printf 'proceed? [y/N] '
+    read -r ans
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { yellow "aborted"; exit 0; }
+  fi
+
+  # Stop the session first (worktrees may be in use)
+  tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+  local wt branch
+  for wt in "${worktrees[@]}"; do
+    branch=$(git -C "$wt" branch --show-current 2>/dev/null || true)
+    git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
+    if [[ -n "$branch" ]]; then
+      git -C "$root" branch -D "$branch" 2>/dev/null || true
+    fi
+    green "  ✓ removed $(basename "$wt") ($branch)"
+  done
+
+  # Remove the container folder if empty
+  local wt_dir; wt_dir=$(worktree_dir)
+  if [[ -d "$wt_dir" ]] && [[ -z "$(ls -A "$wt_dir" 2>/dev/null)" ]]; then
+    rmdir "$wt_dir"
+  fi
+}
+
+# ---------- dispatch ----------
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    init)   load_config; cmd_init   "$@" ;;
+    start)  load_config; cmd_start  "$@" ;;
+    attach) load_config; cmd_attach "$@" ;;
+    stop)   load_config; cmd_stop   "$@" ;;
+    list)   load_config; cmd_list   "$@" ;;
+    clean)  load_config; cmd_clean  "$@" ;;
+    doctor) cmd_doctor ;;
+    help|-h|--help) usage ;;
+    *)      usage; exit 1 ;;
+  esac
+}
+
+main "$@"
